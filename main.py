@@ -1,139 +1,94 @@
-import {
-  Client,
-  GatewayIntentBits,
-  ChannelType,
-  PermissionFlagsBits,
-  type Message,
-  type TextChannel,
-} from "discord.js";
+import discord
+from discord import app_commands
+import aiohttp
+import asyncio
+import os
+import uuid
+from dotenv import load_dotenv
+from aiohttp import web
 
-// =============================================
-// ĐẶT TOKEN BOT CỦA BẠN VÀO ĐÂY
-const TOKEN = "TOKEN_CỦA_BẠN_Ở_ĐÂY";
-// =============================================
+load_dotenv()
 
-const PREFIX = ">";
+intents = discord.Intents.default()
+bot = discord.Client(intents=intents)
+tree = app_commands.CommandTree(bot)
 
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-  ],
-});
+# Thông tin BIDV của bạn (thay bằng thông tin thật)
+BANK_CODE = "BIDV"
+ACCOUNT_NUMBER = "8818603303"   # Số tài khoản BIDV
+ACCOUNT_NAME = "Huỳnh"
 
-// =============================================
-// DANH SÁCH KÊNH SẼ ĐƯỢC TẠO
-const CHANNEL_LIST: string[] = [
-  "𝙉𝙪𝙠𝙚-𝘽𝙮-𝙉𝙜𝙪𝙮ễ𝙣𝙆𝙝ô𝙞",
-];
-// =============================================
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 
-const nukeState = new Map<string, boolean>();
+@bot.event
+async def on_ready():
+    await tree.sync()
+    print(f"✅ Bot {bot.user} đã online!")
 
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+# Lệnh tạo QR
+@tree.command(name="qr", description="Tạo QR thanh toán")
+@app_commands.describe(amount="Số tiền cần thanh toán (ví dụ: 40000)")
+async def qr_command(interaction: discord.Interaction, amount: int):
+    if amount < 1000:
+        await interaction.response.send_message("❌ Số tiền tối thiểu là 1.000đ!", ephemeral=True)
+        return
 
-async function runUsermap(message: Message) {
-  const guild = message.guild;
-  if (!guild) return;
+    order_code = f"DH{uuid.uuid4().hex[:10].upper()}"   # Mã đơn hàng duy nhất
 
-  const member = await guild.members.fetch(message.author.id).catch(() => null);
-  if (!member?.permissions.has(PermissionFlagsBits.ManageChannels)) {
-    await message.reply("❌ Bạn cần quyền **Quản lý Kênh** để dùng lệnh này.");
-    return;
-  }
+    # Tạo link QR động (không cần API Key)
+    qr_url = f"https://qr.sepay.vn/img?acc={ACCOUNT_NUMBER}&bank={BANK_CODE}&amount={amount}&des={order_code}&template=compact"
 
-  if (nukeState.get(guild.id)) {
-    await message.reply("⚠️ Bot đang chạy rồi! Gõ `>stop nuke` để dừng.");
-    return;
-  }
+    embed = discord.Embed(title="💰 Yêu cầu thanh toán", color=0x00ff88)
+    embed.add_field(name="Số tiền", value=f"**{amount:,} VNĐ**", inline=False)
+    embed.add_field(name="Nội dung chuyển khoản", value=f"`{order_code}`", inline=False)
+    embed.add_field(name="Hướng dẫn", value="Quét QR và chuyển khoản **đúng nội dung** ở trên.", inline=False)
+    embed.set_image(url=qr_url)
+    embed.set_footer(text="Bot sẽ tự thông báo khi thanh toán thành công.")
 
-  nukeState.set(guild.id, true);
+    await interaction.response.send_message(embed=embed)
 
-  const statusMsg = await (message.channel as TextChannel).send(
-    `🔁 Bắt đầu tạo kênh liên tục...\nGõ \`>stop nuke\` để dừng.`,
-  );
+# ==================== WEBHOOK NHẬN TỪ SEPAY ====================
+async def webhook_handler(request):
+    try:
+        data = await request.json()
 
-  let count = 0;
+        if data.get("transferType") != "in":
+            return web.Response(text="OK", status=200)
 
-  while (nukeState.get(guild.id)) {
-    for (const name of CHANNEL_LIST) {
-      if (!nukeState.get(guild.id)) break;
-      try {
-        await guild.channels.create({
-          name,
-          type: ChannelType.GuildText,
-        });
-        count++;
-        if (count % 10 === 0) {
-          await statusMsg.edit(
-            `🔁 Đang tạo kênh... Đã tạo **${count}** kênh\nGõ \`>stop nuke\` để dừng.`,
-          ).catch(() => {});
-        }
-      } catch (err: any) {
-        if (err?.status === 429 || err?.httpStatus === 429) {
-          const retryAfter = (err?.retryAfter ?? 1) * 1000;
-          await sleep(retryAfter + 100);
-        } else {
-          await sleep(500);
-        }
-      }
-      await sleep(50);
-    }
-  }
+        amount = int(data.get("transferAmount", 0))
+        content = data.get("content", "").strip()
+        sender = data.get("accountName", "Người lạ")
 
-  await statusMsg.edit(
-    `🛑 Đã dừng! Tổng cộng đã tạo **${count}** kênh.`,
-  );
-}
+        # Chỉ xử lý nếu nội dung bắt đầu bằng DH (mã do bot tạo)
+        if content.startswith("DH") and CHANNEL_ID:
+            channel = bot.get_channel(CHANNEL_ID)
+            if channel:
+                success = discord.Embed(title="✅ Thanh toán thành công!", color=0x00ff00)
+                success.add_field(name="Số tiền", value=f"{amount:,} VNĐ", inline=True)
+                success.add_field(name="Người chuyển", value=sender, inline=True)
+                success.add_field(name="Nội dung", value=content, inline=False)
+                success.add_field(name="Thời gian", value=data.get("transactionDate", "Ngay bây giờ"), inline=False)
 
-async function runStopNuke(message: Message) {
-  const guild = message.guild;
-  if (!guild) return;
+                await channel.send(embed=success)
 
-  if (!nukeState.get(guild.id)) {
-    await message.reply("⚠️ Bot không đang chạy.");
-    return;
-  }
+        return web.Response(text="OK", status=200)
+    except Exception as e:
+        print("Webhook lỗi:", e)
+        return web.Response(text="Error", status=200)
 
-  nukeState.set(guild.id, false);
-  await message.reply("🛑 Đã ra lệnh dừng! Bot sẽ dừng sau khi hoàn thành kênh hiện tại.");
-}
+# Chạy cả bot + web server
+async def main():
+    # Web server
+    app = web.Application()
+    app.router.add_post("/webhook/sepay", webhook_handler)
 
-async function runHelp(message: Message) {
-  await message.reply(
-    `**🤖 Hướng dẫn sử dụng Bot**\n\n` +
-    `\`>usermap\` — Tạo kênh liên tục cho đến khi dừng\n` +
-    `\`>stop nuke\` — Dừng việc tạo kênh\n` +
-    `\`>help\` — Hiện hướng dẫn này`,
-  );
-}
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 8080)))
+    await site.start()
 
-client.once("clientReady", () => {
-  console.log(`✅ Bot online: ${client.user?.tag}`);
-});
+    # Chạy Discord bot
+    await bot.start(os.getenv("DISCORD_TOKEN"))
 
-client.on("messageCreate", async (message) => {
-  if (message.author.bot) return;
-  if (!message.content.startsWith(PREFIX)) return;
-
-  const content = message.content.slice(PREFIX.length).trim().toLowerCase();
-  const args = content.split(/\s+/);
-  const command = args[0];
-
-  try {
-    if (command === "usermap") {
-      await runUsermap(message);
-    } else if (command === "stop" && args[1] === "nuke") {
-      await runStopNuke(message);
-    } else if (command === "help") {
-      await runHelp(message);
-    }
-  } catch (err) {
-    await message.reply("❌ Đã xảy ra lỗi.").catch(() => {});
-  }
-});
-
-client.login(TOKEN);
+if __name__ == "__main__":
+    asyncio.run(main())
